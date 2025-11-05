@@ -1,5 +1,6 @@
 import pandas as pd
 from datetime import date, datetime
+import streamlit as st
 
 def compute_has_TC(
     df: pd.DataFrame,
@@ -54,51 +55,52 @@ def compute_award_points(df: pd.DataFrame, df_tc: pd.DataFrame) -> pd.DataFrame:
     - Level 5 (50 points): if ANY of these codes appear: 
         EC5, EH5, IP5, LD5, MS5, PM5, SR5, VC5
     - DTM (60 points)
-    - TC  (60 points)
+    - TC  (60 points, computed separately from df_tc)
     - FF  (30 points)
     """
 
-    if df.empty:
-        return pd.DataFrame(columns=[
-            "Club Name", "Level_4_Points", "Level_5_Points",
-            "DTM_Points", "TC_Points", "Early10_Distinguished"
-        ])
-
     CLUB_NUMBER = "Club Number"
-    COL_AWARD = "Award"
 
+    # Case when df is empty: return TC scores only
+    if df.empty:
+        tc_scores = calculate_club_points_only_tc(df_tc)
+        return pd.DataFrame({
+            CLUB_NUMBER: tc_scores[CLUB_NUMBER],
+            "L4 Points": 0,
+            "L5 Points": 0,
+            "DTM Points": 0,
+            "TC Points": tc_scores["TC Points"].astype(int),
+            "Early10_Distinguished": 0
+        })
+
+    COL_AWARD = "Award"
     df.rename(columns={"Name": "Club Name"}, inplace=True)
 
-    # Normalise awards text
+    # Normalise award values
     s = df[COL_AWARD].astype(str).str.upper().str.strip()
 
-    # Row-level flags
     df["has_L4"] = s.str.endswith("4")
     df["has_L5"] = s.str.endswith("5")
     df["has_DTM"] = s.eq("DTM")
-    # df["has_TC"] = compute_has_TC(df)
-    df["has_FF"]  = s.eq("FF")
+    df["has_FF"] = s.eq("FF")
 
-    # Collapse to club level
     club_flags = (
-        df.groupby([CLUB_NUMBER, "Club Name"], dropna=False)[["has_L4","has_L5","has_DTM", "has_FF"]]
-          .any()
-          .reset_index()
+        df.groupby([CLUB_NUMBER, "Club Name"], dropna=False)[["has_L4", "has_L5", "has_DTM", "has_FF"]]
+        .any()
+        .reset_index()
     )
-    
-    club_flags['TC Points'] = calculate_club_points(club_flags, df_tc)
 
-    # Map flags → points
-    out = pd.DataFrame({
+    club_flags["TC Points"] = calculate_club_points(club_flags, df_tc)
+
+    return pd.DataFrame({
         CLUB_NUMBER: club_flags[CLUB_NUMBER],
         "L4 Points": club_flags["has_L4"].astype(int) * 40,
         "L5 Points": club_flags["has_L5"].astype(int) * 50,
         "DTM Points": club_flags["has_DTM"].astype(int) * 60,
-        "TC Points":  club_flags["TC Points"].astype(int),
-        "Early10_Distinguished": club_flags["has_FF"].astype(int)  * 30,
+        "TC Points": club_flags["TC Points"].astype(int),
+        "Early10_Distinguished": club_flags["has_FF"].astype(int) * 30
     })
 
-    return out
 
 
 def calculate_points(df: pd.DataFrame, df_edu: pd.DataFrame, df_tc: pd.DataFrame) -> pd.DataFrame:
@@ -121,25 +123,32 @@ def calculate_points(df: pd.DataFrame, df_edu: pd.DataFrame, df_tc: pd.DataFrame
 
     return df
 
-def is_valid_humorous_contest(x: pd.Series) -> bool:
+# ---- 1. Helper to check date range ---- #
+def is_within_time_period(x: pd.Series, start_date: datetime, end_date: datetime) -> bool:
     """
-    Returns True if the Humorous Speech Contest was held on or before 22 Oct 2025.
+    Returns True if at least one valid contest date falls within given range.
     """
-    cutoff = datetime(2025, 10, 24)
-    # Convert to datetime safely (errors='coerce' will turn invalid entries into NaT)
+    if x.empty or x.dropna().empty:
+        return False
+
     dates = pd.to_datetime(x, errors='coerce', dayfirst=False)
-    # Return True only if at least one valid date <= cutoff
-    return (dates.notna() & (dates <= cutoff)).any()
+    return (dates.notna() & (dates >= start_date) & (dates <= end_date)).any()
 
 
 def calculate_contest_points(df: pd.DataFrame) -> pd.DataFrame:
     """
     Returns one row per club with four contest scores as columns.
-    Score = 10 if contest date is entered, else 0.
+    Score = 10 if contest happened within given date window, otherwise 0.
+    No double points for duplicates (handled by groupby).
     """
+
+    # ---- 2. load date window from secrets ---- #
+    start_date = datetime.strptime(st.secrets["QUARTER_START_DATE"], "%Y-%m-%d")
+    end_date   = datetime.strptime(st.secrets["QUARTER_END_DATE"], "%Y-%m-%d")
 
     COL_CLUB = "Select Your Club"
     CLUB_NUMBER = "Club Number"
+
     date_cols = {
         "Humorous Contest": "Date the Humorous Speech Contest was held",
         "TableTopics Contest": "Date the Table Topics Contest was held",
@@ -147,43 +156,32 @@ def calculate_contest_points(df: pd.DataFrame) -> pd.DataFrame:
         "International Contest": "Date the International Speech Contest was held",
     }
 
-    # Handle empty input → return empty with expected columns
+    # ---- 3. Handle empty input ---- #
     if df.empty:
-        return pd.DataFrame(
-            columns=["Club Number"] + list(date_cols.keys())
-        )
+        return pd.DataFrame(columns=[CLUB_NUMBER] + list(date_cols.keys()))
 
-    # Clean club names
-    df[CLUB_NUMBER] = df[COL_CLUB].str.split('---- ').str[-1].str.strip()
-    df[COL_CLUB] = df[COL_CLUB].str.split(' ----').str[0].str.strip()
+    # ---- 4. Extract club number + name ---- #
+    df[CLUB_NUMBER] = df[COL_CLUB].str.split("---- ").str[-1].str.strip()
+    df[COL_CLUB] = df[COL_CLUB].str.split(" ----").str[0].str.strip()
 
-    # Start with club column
+    # ---- 5. Base scoring DF ---- #
     scores = pd.DataFrame()
     scores[CLUB_NUMBER] = df[CLUB_NUMBER].unique()
 
-    # For each contest, compute max score
+    # ---- 6. Compute contest scores ---- #
     for contest, col in date_cols.items():
-        if contest == "Humorous Contest":
-            # Apply cutoff rule using the helper function
-            scores_contest = (
-                df.groupby(CLUB_NUMBER)[col]
-                .apply(lambda x: 10 if is_valid_humorous_contest(x) else 0)
-                .reset_index(name=contest)
-            )
-        else:
-            # Default rule (any non-empty date)
-            scores_contest = (
-                df.groupby(CLUB_NUMBER)[col]
-                .apply(lambda x: 10 if x.notna().any() and (x.astype(str).str.strip() != "").any() else 0)
-                .reset_index(name=contest)
-            )
+        scores_contest = (
+            df.groupby(CLUB_NUMBER)[col]
+              .apply(lambda x: 10 if is_within_time_period(x, start_date, end_date) else 0)
+              .reset_index(name=contest)
+        )
 
-        scores = scores.merge(scores_contest, left_on="Club Number", right_on=CLUB_NUMBER)
+        scores = scores.merge(scores_contest, on=CLUB_NUMBER)
 
-    scores["Club Number"] = scores["Club Number"].astype(int)
+    # Numeric club number
+    scores[CLUB_NUMBER] = scores[CLUB_NUMBER].astype(int)
 
     return scores
-
 
 def assign_grouping(df: pd.DataFrame) -> pd.DataFrame:
     # Define group by active members
@@ -226,22 +224,22 @@ def mot_scores(df: pd.DataFrame) -> pd.DataFrame:
 
     # If input is empty → return empty with expected columns
     if df.empty:
-        return pd.DataFrame(columns=["Club Name", "MOT_Q1", "MOT_Q3"])
+        return pd.DataFrame(columns=["Club Name", "MOT"])
     
     CLUB_NUMBER = "Club Number"
+    COL_DATE = "Date the MOT session was conducted"
 
     df[CLUB_NUMBER] = df[COL_CLUB].str.split('---- ').str[-1].str.strip()
     df[COL_CLUB] = df[COL_CLUB].str.split(' ----').str[0].str.strip()
-    # convert to datetime (dayfirst since it's dd/mm/yyyy)
-    mot_dates = pd.to_datetime(df[COL_DATE], dayfirst=True, errors="coerce").dt.date
 
-    q1_start, q1_end = date(2025, 7, 1), date(2025, 12, 31)
-    q2_start, q2_end = date(2026, 1, 1), date(2026, 6, 30)
+    start_date = datetime.strptime(st.secrets["QUARTER_START_DATE"], "%Y-%m-%d")
+    end_date   = datetime.strptime(st.secrets["QUARTER_END_DATE"], "%Y-%m-%d")
+
+    df = df[df[COL_DATE].apply(lambda x: is_within_time_period(pd.Series([x]), start_date, end_date))]
 
     df_out = pd.DataFrame({
         CLUB_NUMBER: df[CLUB_NUMBER],
-        "MOT_Q1": ((mot_dates >= q1_start) & (mot_dates <= q1_end)).astype(int) * 15,
-        "MOT_Q3": ((mot_dates >= q2_start) & (mot_dates <= q2_end)).astype(int) * 15
+        "MOT": 15
     })
 
     df_out[CLUB_NUMBER] = df_out[CLUB_NUMBER].astype(int)
@@ -256,9 +254,18 @@ def pathways_completion_scores(df: pd.DataFrame) -> pd.DataFrame:
 
     COL_CLUB = "Select Your Club"
     CLUB_NUMBER = "Club Number"
+    COL_DATE = "Date of the celebration event"
+
+    if df.empty:
+        return pd.DataFrame(columns=["Club Number", "Pathways_Completion_Celebration"])
 
     df[CLUB_NUMBER] = df[COL_CLUB].str.split('---- ').str[-1].str.strip()
     df[COL_CLUB] = df[COL_CLUB].str.split(' ----').str[0].str.strip()
+
+    start_date = datetime.strptime(st.secrets["QUARTER_START_DATE"], "%Y-%m-%d")
+    end_date   = datetime.strptime(st.secrets["QUARTER_END_DATE"], "%Y-%m-%d")
+
+    df = df[df[COL_DATE].apply(lambda x: is_within_time_period(pd.Series([x]), start_date, end_date))]
 
     df_out = pd.DataFrame({
         CLUB_NUMBER: df[CLUB_NUMBER],
@@ -277,9 +284,18 @@ def mentorship_programme_scores(df: pd.DataFrame) -> pd.DataFrame:
 
     COL_CLUB = "Select Your Club"
     CLUB_NUMBER = "Club Number"
+    COL_DATE = "Timestamp"
+
+    if df.empty:
+        return pd.DataFrame(columns=["Club Number", "Mentorship_Programme"])
 
     df[CLUB_NUMBER] = df[COL_CLUB].str.split('---- ').str[-1].str.strip()
     df[COL_CLUB] = df[COL_CLUB].str.split(' ----').str[0].str.strip()
+
+    start_date = datetime.strptime(st.secrets["QUARTER_START_DATE"], "%Y-%m-%d")
+    end_date   = datetime.strptime(st.secrets["QUARTER_END_DATE"], "%Y-%m-%d")
+
+    df = df[df[COL_DATE].apply(lambda x: is_within_time_period(pd.Series([x]), start_date, end_date))]
 
     df_out = pd.DataFrame({
         CLUB_NUMBER: df[CLUB_NUMBER],
@@ -297,9 +313,18 @@ def distinguished_club_partners_scores(df: pd.DataFrame) -> pd.DataFrame:
     """
     COL_CLUB = "Select Your Club"
     CLUB_NUMBER = "Club Number"
+    COL_DATE = "Timestamp"
+
+    if df.empty:
+        return pd.DataFrame(columns=["Club Number", "Distinguished_Club_Partners"])
 
     df[CLUB_NUMBER] = df[COL_CLUB].str.split('---- ').str[-1].str.strip()
     df[COL_CLUB] = df[COL_CLUB].str.split(' ----').str[0].str.strip()
+
+    start_date = datetime.strptime(st.secrets["QUARTER_START_DATE"], "%Y-%m-%d")
+    end_date   = datetime.strptime(st.secrets["QUARTER_END_DATE"], "%Y-%m-%d")
+
+    df = df[df[COL_DATE].apply(lambda x: is_within_time_period(pd.Series([x]), start_date, end_date))]
 
     df_out = pd.DataFrame({
         "Club Number": df[CLUB_NUMBER],
@@ -317,9 +342,18 @@ def successful_handover_scores(df: pd.DataFrame) -> pd.DataFrame:
     """
     COL_CLUB = "Select Your Club"
     CLUB_NUMBER = "Club Number"
+    COL_DATE = "Date the transition meeting or handover session took place"
+
+    if df.empty:
+        return pd.DataFrame(columns=["Club Number", "Successful_Transition_Handover"])
 
     df[CLUB_NUMBER] = df[COL_CLUB].str.split('---- ').str[-1].str.strip()
     df[COL_CLUB] = df[COL_CLUB].str.split(' ----').str[0].str.strip()
+
+    start_date = datetime.strptime(st.secrets["QUARTER_START_DATE"], "%Y-%m-%d")
+    end_date   = datetime.strptime(st.secrets["QUARTER_END_DATE"], "%Y-%m-%d")
+
+    df = df[df[COL_DATE].apply(lambda x: is_within_time_period(pd.Series([x]), start_date, end_date))]
 
     df_out = pd.DataFrame({
         CLUB_NUMBER: df[CLUB_NUMBER],
@@ -337,9 +371,18 @@ def quality_initiatives_scores(df: pd.DataFrame) -> pd.DataFrame:
     """
     COL_CLUB = "Select Your Club"
     CLUB_NUMBER = "Club Number"
+    COL_DATE = "Timestamp"
+
+    if df.empty:
+        return pd.DataFrame(columns=["Club Number", "Quality_Initiatives"])
 
     df[CLUB_NUMBER] = df[COL_CLUB].str.split('---- ').str[-1].str.strip()
     df[COL_CLUB] = df[COL_CLUB].str.split(' ----').str[0].str.strip()
+
+    start_date = datetime.strptime(st.secrets["QUARTER_START_DATE"], "%Y-%m-%d")
+    end_date   = datetime.strptime(st.secrets["QUARTER_END_DATE"], "%Y-%m-%d")
+
+    df = df[df[COL_DATE].apply(lambda x: is_within_time_period(pd.Series([x]), start_date, end_date))]
 
     df_out = pd.DataFrame({
         "Club Number": df[CLUB_NUMBER],
@@ -357,9 +400,18 @@ def member_onboarding_scores(df: pd.DataFrame) -> pd.DataFrame:
     """
     COL_CLUB = "Select Your Club"
     CLUB_NUMBER = "Club Number"
+    COL_DATE = "Timestamp"
+
+    if df.empty:
+        return pd.DataFrame(columns=["Club Number", "Member_Onboarding"])
 
     df[CLUB_NUMBER] = df[COL_CLUB].str.split('---- ').str[-1].str.strip()
     df[COL_CLUB] = df[COL_CLUB].str.split(' ----').str[0].str.strip()
+
+    start_date = datetime.strptime(st.secrets["QUARTER_START_DATE"], "%Y-%m-%d")
+    end_date   = datetime.strptime(st.secrets["QUARTER_END_DATE"], "%Y-%m-%d")
+
+    df = df[df[COL_DATE].apply(lambda x: is_within_time_period(pd.Series([x]), start_date, end_date))]
 
     df_out = pd.DataFrame({
         CLUB_NUMBER: df[CLUB_NUMBER],
@@ -376,6 +428,9 @@ def pathway_enrollment_scores(df: pd.DataFrame) -> pd.DataFrame:
     - 10 points if all members in a club are enrolled in Pathways
     """
     
+    if df.empty:
+        return pd.DataFrame(columns=["Club Number", "100%_Pathway_Registration"])
+
     df.columns = df.iloc[0]   # Set second row as header
     df = df[1:].reset_index(drop=True)   # Drop the old header row
 
@@ -414,15 +469,24 @@ def calculate_club_points(
     ):
     
     POINTS_PER_MEMBER = 60
+
+    COL_DATE = "Month"
+
+    if members_df.empty:
+        unique_members_count = pd.DataFrame(columns=["Club Number", "unique_members"])
+
+    start_date = datetime.strptime(st.secrets["QUARTER_START_DATE"], "%Y-%m-%d")
+    end_date   = datetime.strptime(st.secrets["QUARTER_END_DATE"], "%Y-%m-%d")
+
+    members_df = members_df[members_df[COL_DATE].apply(lambda x: is_within_time_period(pd.Series([x]), start_date, end_date))]
     
-    unique_members_count = members_df.groupby('Club Name')['Member'].nunique().reset_index()
-    unique_members_count.columns = ['club_name', 'unique_members']
-    
-    # Merge base_df with unique member counts
+    unique_members_count = members_df.groupby('Club Number')['Member'].nunique().reset_index()
+    unique_members_count.columns = ['Club Number', 'unique_members']
+
     merged_df = base_df.merge(
         unique_members_count,
-        left_on='Club Name',
-        right_on='club_name',
+        left_on='Club Number',
+        right_on='Club Number',
         how='left'
     )
     
@@ -436,3 +500,25 @@ def calculate_club_points(
     points_list = merged_df['points'].tolist()
     
     return points_list
+
+def calculate_club_points_only_tc(members_df: pd.DataFrame) -> pd.DataFrame:
+    
+    POINTS_PER_MEMBER = 60
+
+    COL_DATE = "Month"
+
+    if members_df.empty:
+        unique_members_count = pd.DataFrame(columns=["Club Number", "TC Points"])
+
+    start_date = datetime.strptime(st.secrets["QUARTER_START_DATE"], "%Y-%m-%d")
+    end_date   = datetime.strptime(st.secrets["QUARTER_END_DATE"], "%Y-%m-%d")
+
+    members_df = members_df[members_df[COL_DATE].apply(lambda x: is_within_time_period(pd.Series([x]), start_date, end_date))]
+    
+    unique_members_count = members_df.groupby('Club Number')['Member'].nunique().reset_index()
+    unique_members_count.columns = ['Club Number', 'unique_members']
+    
+    # Calculate points: unique_members * 60
+    unique_members_count['TC Points'] = unique_members_count['unique_members'] * POINTS_PER_MEMBER
+
+    return unique_members_count[['Club Number', 'TC Points']]

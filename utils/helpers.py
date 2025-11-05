@@ -45,30 +45,145 @@ def load_club_performance_data(secret_key: str) -> pd.DataFrame:
             update_date = "Not available"
 
         df = df[df["Club Name"].notna()]  # Filter rows with non-empty club names
+        df["Club Number"] = df["Club Number"].astype(int)
         return df, update_date
 
     except Exception as e:
         st.warning(f"Could not load Club Performance data: {e}")
         return pd.DataFrame(), 'January 01, 1900'  # Return empty DataFrame on failure
 
+def load_incentive_winners(secret_key: str) -> pd.DataFrame:
+    """
+    Loads Incentive winners list from Google Drive using a secret key.
+    
+    Args:
+        secret_key (str): The key to access the file ID from Streamlit secrets.
+
+    Returns:
+        pd.DataFrame
+    """
+    try:
+        file_id = st.secrets[secret_key]
+        gsheet_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+        df = pd.read_excel(gsheet_url, header=2)
+
+        return df
+
+    except Exception as e:
+        st.warning(f"Could not Incentive Winners list: {e}")
+        return pd.DataFrame()
+
+
+def get_quarter_delta(df_latest: pd.DataFrame, 
+                      df_last_quarter: pd.DataFrame, 
+                      cols_to_diff: list[str],
+                      merge_on: str = "Club Number") -> pd.DataFrame:
+    """
+    Compute quarter-only data by subtracting last quarter snapshot from the latest YTD data.
+
+    Parameters:
+        df_latest (pd.DataFrame): Latest YTD data (e.g., Q2)
+        df_last_quarter (pd.DataFrame): Snapshot as of end of last quarter (e.g., Q1)
+        cols_to_diff (list[str]): List of metric columns to compute delta on
+        merge_on (str): Column to merge on (default = "Club Number")
+
+    Returns:
+        pd.DataFrame: New dataframe with quarter-only values
+    """
+
+    # Standardize merge key (e.g., strip whitespace, uppercase)
+    df_latest[merge_on] = df_latest[merge_on].astype(str).str.strip().str.upper()
+    df_last_quarter[merge_on] = df_last_quarter[merge_on].astype(str).str.strip().str.upper()
+
+    # Merge both snapshots on Club Number
+    df_merged = df_latest.merge(
+        df_last_quarter,
+        on=merge_on,
+        suffixes=("_latest", "_q1"),
+        how="left"
+    )
+
+    # Subtract old values from latest
+    for col in cols_to_diff:
+        col_latest = f"{col}_latest"
+        col_q1 = f"{col}_q1"
+        df_merged[col] = df_merged.get(col_latest, 0) - df_merged.get(col_q1, 0).fillna(0)
+
+    # Keep only Club Number and computed delta columns
+    return df_merged[[merge_on] + cols_to_diff]
+
+def get_csp_improvement(df_latest: pd.DataFrame, df_last_quarter: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns a DataFrame with Club Number and updated CSP value:
+    - 'Y' if current CSP is 'Y' and previous was 'N' or missing.
+    - 'N' otherwise.
+    """
+
+    # Extract and rename columns from last quarter
+    prev_csp = df_last_quarter[['Club Number', 'CSP']].rename(columns={'CSP': 'CSP_Previous'})
+    
+    # Merge current with previous
+    merged = df_latest[['Club Number', 'CSP']].merge(prev_csp, on='Club Number', how='left')
+
+    # Apply logic to determine improvement
+    merged['CSP'] = merged.apply(
+        lambda row: 'Y' if row['CSP'] == 'Y' and row.get('CSP_Previous', 'N') != 'Y' else 'N',
+        axis=1
+    )
+    merged['Club Number'] = merged['Club Number'].astype(int)
+    return merged[['Club Number', 'CSP']]
+
 # ------------------ Load and Prepare Data ------------------ #
 def load_data_club_performance(gsheet_url=None):
 
-    df_base, quater_base_date = load_club_performance_data(secret_key = "GOOGLE_DRIVE_FILE_ID_CLUB_PERFORMANCE_BASE")
-    df_latest, update_date = load_club_performance_data(secret_key = "GOOGLE_DRIVE_FILE_ID_CLUB_PERFORMANCE")
-    
+    cq = st.secrets["Current_Quarter"]
+
+    # Map current to last quarter
+    quarter_map = {
+        "Q1": None,
+        "Q2": "Q1",
+        "Q3": "Q2",
+        "Q4": "Q3"
+    }
+    lq = quarter_map.get(cq)
+
+    # Load common data
+    df_base, quarter_base_date = load_club_performance_data(secret_key="GOOGLE_DRIVE_FILE_ID_CLUB_PERFORMANCE_BASE_" + cq)
+    df_latest, update_date = load_club_performance_data(secret_key="GOOGLE_DRIVE_FILE_ID_CLUB_PERFORMANCE_" + cq)
+
+    # Column groups
     base_col = ['District', 'Division', 'Area', 'Club Number', 'Club Name',
-       'Club Status', 'Mem. Base', 'Active Members', 'Net Growth']
+                'Club Status', 'Mem. Base', 'Active Members', 'Net Growth']
+
     other_col = ['Club Number', 'CSP', 'Goals Met', 'Level 1s', 'Level 2s', 'Add. Level 2s', 'Level 3s',
-       'Level 4s, Path Completions, or DTM Awards',
-       'Add. Level 4s, Path Completions, or DTM award', 'New Members',
-       'Add. New Members', 'Off. Trained Round 1', 'Off. Trained Round 2',
-       'Mem. dues on time Oct', 'Mem. dues on time Apr', 'Off. List On Time',
-       'Club Distinguished Status']
+                'Level 4s, Path Completions, or DTM Awards',
+                'Add. Level 4s, Path Completions, or DTM award', 'New Members',
+                'Add. New Members', 'Off. Trained Round 1', 'Off. Trained Round 2',
+                'Mem. dues on time Oct', 'Mem. dues on time Apr', 'Off. List On Time',
+                'Club Distinguished Status']
 
-    df = df_base[base_col].merge(df_latest[other_col], on='Club Number', how='left')
+    # Compute current quarter-only data
+    if lq is None:
+        # First quarter — use latest as-is
+        df_current_only = df_latest[other_col].copy()
+    else:
+        # Load last quarter data and compute delta
+        df_last_quarter, _ = load_club_performance_data(secret_key="GOOGLE_DRIVE_FILE_ID_CLUB_PERFORMANCE_" + lq)
+        df_current_only = get_quarter_delta(
+            df_latest=df_latest,
+            df_last_quarter=df_last_quarter,
+            cols_to_diff=[x for x in other_col if x not in ["Club Number", "CSP"]],
+            merge_on="Club Number"
+        )
+        df_current_only["Club Number"] = df_current_only["Club Number"].astype(int)
 
-    new_clubs = df_latest[~df_latest["Club Number"].isin(df_base["Club Number"])]
+    df = df_base[base_col].merge(df_current_only, on='Club Number', how='left')
+
+    df_updated_csp = get_csp_improvement(df_latest, df_last_quarter)
+    df = df.merge(df_updated_csp, on='Club Number', how='left')
+
+    new_clubs = df_current_only[~df_current_only["Club Number"].isin(df_base["Club Number"])]
 
     df = pd.concat([df, new_clubs], ignore_index=True)
 
@@ -77,6 +192,7 @@ def load_data_club_performance(gsheet_url=None):
     df_edu_achievements = load_excel_data("GOOGLE_DRIVE_FILE_ID_EDU_ACHIEVEMENTS", ["Club", "Name", "Award", "Date"], sheet_name="Sheet1")
     df_edu_achievements.rename(columns={"Club": "Club Number"}, inplace=True)
     df_tc = load_excel_data("GOOGLE_DRIVE_FILE_ID_TRIPLE_CROWN", ["Club Name", "Member"], sheet_name="300925")
+    df_tc = df[['Club Name', 'Club Number']].merge(df_tc, how = 'inner')
     df = calculate_points(df, df_edu_achievements, df_tc)
     df = assign_grouping(df)
     # df = df[df['Group'] != 'Unknown']
@@ -106,7 +222,7 @@ def load_excel_data(secret_key: str, columns: list[str], sheet_name="Sheet1") ->
         gsheet_url = f"https://drive.google.com/uc?export=download&id={file_id}"
         df = pd.read_excel(gsheet_url, sheet_name=sheet_name, skiprows=1)
     except Exception as e:
-        st.warning(f"Could not load Education Achievements data: {e}")
+        # st.warning(f"Could not load Education Achievements data: {e}")
         df = pd.DataFrame(columns=columns)
     return df
 
@@ -158,7 +274,7 @@ def prepare_leadership_innovators_data(df_club_performance):
     df = df_club_performance.copy()
 
     # Load and process MOT data
-    df_mot = load_csv_from_secret("GOOGLE_DRIVE_FILE_ID_MOMENTS_OF_TRUTH", ["Select Your Club", "MOT_Q1", "MOT_Q3"])
+    df_mot = load_csv_from_secret("GOOGLE_DRIVE_FILE_ID_MOMENTS_OF_TRUTH", ["Select Your Club", "MOT"])
     df_mot_scores = mot_scores(df_mot)
 
     df_leadership_innovators = df.merge(df_mot_scores, left_on="Club Number", right_on="Club Number", how="left")
@@ -190,7 +306,7 @@ def prepare_leadership_innovators_data(df_club_performance):
 
     # Add tier points
     df_leadership_innovators['Leadership Innovators'] = (
-        df_leadership_innovators[['COT R1 Points', 'COT R2 Points', 'MOT_Q1', 'MOT_Q3', 
+        df_leadership_innovators[['COT R1 Points', 'COT R2 Points', 'MOT', 
                                   'Pathways_Completion_Celebration','Mentorship_Programme',
                                   'President_Distinguished', 'Smedley_Distinguished',
                                   'Distinguished_Club_Partners', 'Successful_Transition_Handover']].sum(axis=1)
@@ -198,7 +314,7 @@ def prepare_leadership_innovators_data(df_club_performance):
 
     # Select columns and format
     columns = ['Club Name', 'Club Number', 'Club Group', 'Active Members', 'Leadership Innovators',
-               'COT R1 Points', 'COT R2 Points', 'MOT_Q1', 'MOT_Q3', 
+               'COT R1 Points', 'COT R2 Points', 'MOT', 
                 'Pathways_Completion_Celebration','Mentorship_Programme',
                 'President_Distinguished', 'Smedley_Distinguished',
                 'Distinguished_Club_Partners', 'Successful_Transition_Handover']
